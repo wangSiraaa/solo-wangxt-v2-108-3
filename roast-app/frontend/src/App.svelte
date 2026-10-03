@@ -1,6 +1,7 @@
 <script>
   import { onMount } from 'svelte';
   import RoastChart from './lib/RoastChart.svelte';
+  import ImportPanel from './lib/ImportPanel.svelte';
   import {
     getBatches,
     seed,
@@ -157,6 +158,8 @@
           t_s: p.t_s,
           bean_temp_c: p.bean_temp_c,
           env_temp_c: p.env_temp_c,
+          source: p.source,
+          import_package_id: p.import_package_id,
         })),
         events: ex.events,
         params: ex.params,
@@ -170,6 +173,25 @@
         recomputed: rc.metrics[k],
         match: ex.metrics[k] === rc.metrics[k],
       }));
+      // Imported provenance must survive the independent recompute, and the
+      // full append-only event history must come back identical.
+      const originsMatch =
+        JSON.stringify(
+          rc.sample_origins.map((o) => [o.t_s, o.source, o.import_package_id])
+        ) ===
+        JSON.stringify(
+          ex.series.raw_points.map((p) => [p.t_s, p.source, p.import_package_id])
+        );
+      const historyMatch =
+        rc.event_history.length === ex.events.length &&
+        rc.event_history.every(
+          (e, i) =>
+            e.id === ex.events[i].id &&
+            e.event_type === ex.events[i].event_type &&
+            e.t_s === ex.events[i].t_s &&
+            e.superseded === ex.events[i].superseded &&
+            (e.import_package_id || null) === (ex.events[i].import_package_id || null)
+        );
       // Changing window/smoothing must leave every stored sample untouched.
       const alt = await getSeries(selA, {
         window_s: windowS * 2,
@@ -179,7 +201,7 @@
       const sig = (arr) =>
         JSON.stringify(arr.map((p) => [p.t_s, p.bean_temp_c, p.env_temp_c]));
       const rawSame = sig(ex.series.raw_points) === sig(alt.series.raw_points);
-      verifyResult = { rows, rawSame, exportObj: ex };
+      verifyResult = { rows, rawSame, originsMatch, historyMatch, exportObj: ex };
     } catch (e) {
       error = e.message;
     } finally {
@@ -198,12 +220,45 @@
     a.click();
   }
 
+  // Observation-package import callbacks (ImportPanel owns the ledger UI).
+  async function onImportChanged() {
+    const prevId = selA;
+    await loadBatchesKeepSelection(prevId);
+  }
+
+  async function loadBatchesKeepSelection(keepId) {
+    batches = await getBatches();
+    if (keepId && batches.some((b) => b.id === keepId)) {
+      selA = keepId;
+    } else if (batches.length) {
+      selA = batches[0].id;
+    }
+    await refresh();
+  }
+
+  async function onImportApplied(e) {
+    const batchId = e.detail?.batchId;
+    batches = await getBatches();
+    if (batchId) selA = batchId;
+    else if (batches.length) selA = batches[batches.length - 1].id;
+    showHistory = true; // surface append-only/superseded rows from the package
+    await refresh();
+  }
+
   $: chartPayloads =
     view === 'compare' && comparePayload
       ? comparePayload.batches
       : dataA
         ? [dataA]
         : [];
+
+  // Provenance badges for the current batch's measured points.
+  $: sampleSources = dataA
+    ? [...new Set(dataA.series.raw_points.map((p) => p.source))]
+    : [];
+  $: samplePackages = dataA
+    ? [...new Set(dataA.series.raw_points.map((p) => p.import_package_id).filter(Boolean))]
+    : [];
 
   let refreshTimer;
   function scheduleRefresh() {
@@ -311,11 +366,14 @@
     </div>
   </section>
 
+  <ImportPanel on:changed={onImportChanged} on:applied={onImportApplied} />
+
   {#if dataA}
     <section class="panel">
       <RoastChart {chartPayloads} {windowS} {smoothS} />
       <div class="row" style="margin-top:6px;font-size:12px">
-        <span class="tag">圆点＝实测豆温</span>
+        <span class="tag">圆点＝合成/既有实测豆温</span>
+        <span class="tag">绿三角＝观察包导入实测豆温</span>
         <span class="tag">虚线菱形＝线性插值（非实测）</span>
         <span class="tag">细点线＝环境温度</span>
         <span class="tag">金色竖虚线＝风门变化</span>
@@ -406,7 +464,7 @@
         </div>
 
         <table style="margin-top:10px">
-          <tr><th>事件</th><th>时间</th><th>来源</th><th>备注</th><th>状态</th></tr>
+          <tr><th>事件</th><th>时间</th><th>来源</th><th>包标识</th><th>备注</th><th>状态</th></tr>
           {#each eventHistory as e}
             <tr style={e.superseded ? 'opacity:.45' : ''}>
               <td>
@@ -418,7 +476,11 @@
                 <span class="tag {e.source}">{e.source === 'manual' ? '人工' : '自动建议'}</span>
                 {e.created_by}
               </td>
-              <td class="muted" style="font-size:11px;max-width:180px;overflow:hidden;text-overflow:ellipsis">
+              <td class="muted" style="font-size:11px;max-width:120px;overflow:hidden;text-overflow:ellipsis"
+                  title={e.import_package_id || ''}>
+                {e.import_package_id ? `📦 ${e.import_package_id}` : '—'}
+              </td>
+              <td class="muted" style="font-size:11px;max-width:160px;overflow:hidden;text-overflow:ellipsis">
                 {e.label}
               </td>
               <td>{e.superseded ? '已被修正取代（保留）' : '当前'}</td>
@@ -457,6 +519,17 @@
             总点 {dataA.series.raw_points.length}；
             插值点 {dataA.series.interpolated_t_s.length} 个，仅用于引导线，不写回原始采样表。
           </div>
+          <div class="muted" style="font-size:12px;margin-top:2px">
+            样本来源：
+            {#each sampleSources as src}
+              <span class="tag {src === 'observation_package' ? 'tag-applied' : ''}">
+                {src === 'observation_package' ? '📦 观察包' : src}
+              </span>
+            {/each}
+            {#each samplePackages as pid}
+              <span class="tag tag-pending" title="稳定包标识">{pid}</span>
+            {/each}
+          </div>
         </div>
         <div style="flex:1;min-width:280px">
           <button on:click={verifyExport}>
@@ -479,6 +552,14 @@
                 改变窗口/平滑后原始豆温/环温逐点比对：
                 {verifyResult.rawSame ? '✅ 完全不变' : '❌ 被修改'}
               </span>
+              <div style="margin-top:4px">
+                独立重算样本来源/包标识：
+                {verifyResult.originsMatch ? '✅ 完全一致' : '❌ 不一致'}
+              </div>
+              <div>
+                独立重算事件只追加历史（含 superseded 与包标识）：
+                {verifyResult.historyMatch ? '✅ 完全一致' : '❌ 不一致'}
+              </div>
               <button class="ghost" style="margin-left:10px" on:click={downloadExport}>
                 下载导出 JSON
               </button>

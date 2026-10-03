@@ -28,10 +28,17 @@ class EventOut(EventIn):
     batch_id: int
     superseded: bool
     superseded_by_id: int | None = None
+    import_package_id: str | None = None
     created_at: datetime
 
     class Config:
         from_attributes = True
+
+
+class ImportResolutions(BaseModel):
+    """Conflict adjudication: ref -> keep_existing | use_incoming | supersede."""
+
+    resolutions: dict[str, str]
 
 
 class BatchMeta(BaseModel):

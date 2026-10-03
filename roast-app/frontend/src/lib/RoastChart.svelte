@@ -67,8 +67,24 @@
     payloads.forEach((pl, bi) => {
       const c = PALETTE[bi % PALETTE.length];
       const pts = pl.series.raw_points;
+      // Provenance-distinct measured symbols: synthetic = round dot,
+      // imported observation package = diamond outline.  Interpolated
+      // (non-measured) points are handled separately below.
       const measured = pts
-        .filter((p) => !p.is_interpolated && p.bean_temp_c !== null)
+        .filter(
+          (p) =>
+            !p.is_interpolated &&
+            p.bean_temp_c !== null &&
+            p.source !== 'observation_package'
+        )
+        .map((p) => [p.t_s, p.bean_temp_c]);
+      const measuredImported = pts
+        .filter(
+          (p) =>
+            !p.is_interpolated &&
+            p.bean_temp_c !== null &&
+            p.source === 'observation_package'
+        )
         .map((p) => [p.t_s, p.bean_temp_c]);
 
       // measured guide runs (solid) and interpolated runs (dashed hollow)
@@ -98,6 +114,20 @@
         z: 4,
       };
       series.push(scatterSpec);
+
+      if (measuredImported.length) {
+        series.push({
+          name: bi === 0 ? '观察包实测点' : `观察包 ${pl.batch.name}`,
+          type: 'scatter',
+          data: measuredImported,
+          symbol: 'triangle',
+          symbolSize: 7,
+          itemStyle: { color: '#8fdca8', borderColor: '#1f3d2a', borderWidth: 1 },
+          xAxisIndex: 0,
+          yAxisIndex: 0,
+          z: 5,
+        });
+      }
 
       guideRuns(pts, 'bean_temp_c', true).forEach((run) => {
         series.push({
@@ -189,7 +219,7 @@
         valueFormatter: (v) => (v === null || v === undefined ? '缺测' : Number(v).toFixed(1)),
       },
       legend: {
-        data: ['豆温实测点', '插值段(非实测)', '环境温度', '温升率 RoR'],
+        data: ['豆温实测点', '观察包实测点', '插值段(非实测)', '环境温度', '温升率 RoR'],
         textStyle: { color: '#a89b8c' },
         top: 0,
       },

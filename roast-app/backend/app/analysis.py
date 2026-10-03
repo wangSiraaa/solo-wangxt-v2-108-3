@@ -239,6 +239,11 @@ def build_series(
             "ror_n_points": int(ror["n_points_used"][i]),
             "ror_edge": bool(ror["edge"][i]),
             "is_interpolated": bool(bean_interp[i]),
+            # Provenance passthrough: every measured point reports where it was
+            # recorded and which offline package delivered it.  Analysis never
+            # invents a source; legacy callers that omit these get "synthetic".
+            "source": samples[i].get("source", "synthetic"),
+            "import_package_id": samples[i].get("import_package_id"),
         }
         for i in range(len(t))
     ]
