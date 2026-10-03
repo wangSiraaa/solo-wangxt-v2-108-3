@@ -99,6 +99,38 @@
       };
       series.push(scatterSpec);
 
+      // Measured points delivered by offline observation packages get a
+      // distinct star marker so the source package is visible on the curve.
+      const imported = pts
+        .filter(
+          (p) =>
+            !p.is_interpolated &&
+            p.bean_temp_c !== null &&
+            p.source_package_id != null
+        )
+        .map((p) => ({
+          value: [p.t_s, p.bean_temp_c],
+          sourcePackage: p.source_package_id,
+        }));
+      if (imported.length) {
+        series.push({
+          name: '观察包导入点',
+          type: 'scatter',
+          data: imported,
+          symbol: 'triangle',
+          symbolSize: 8,
+          itemStyle: { color: '#7ee0c2' },
+          xAxisIndex: 0,
+          yAxisIndex: 0,
+          z: 5,
+          tooltip: {
+            formatter: (p) =>
+              `${Math.floor(p.value[0] / 60)}:${String(Math.round(p.value[0] % 60)).padStart(2, '0')} ` +
+              `${Number(p.value[1]).toFixed(1)}°C · 来源包 ${p.data.sourcePackage}`,
+          },
+        });
+      }
+
       guideRuns(pts, 'bean_temp_c', true).forEach((run) => {
         series.push({
           name: '插值段(非实测)',
@@ -189,7 +221,7 @@
         valueFormatter: (v) => (v === null || v === undefined ? '缺测' : Number(v).toFixed(1)),
       },
       legend: {
-        data: ['豆温实测点', '插值段(非实测)', '环境温度', '温升率 RoR'],
+        data: ['豆温实测点', '观察包导入点', '插值段(非实测)', '环境温度', '温升率 RoR'],
         textStyle: { color: '#a89b8c' },
         top: 0,
       },

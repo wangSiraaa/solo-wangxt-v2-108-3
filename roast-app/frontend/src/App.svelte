@@ -1,6 +1,7 @@
 <script>
   import { onMount } from 'svelte';
   import RoastChart from './lib/RoastChart.svelte';
+  import ImportPanel from './lib/ImportPanel.svelte';
   import {
     getBatches,
     seed,
@@ -210,6 +211,19 @@
     clearTimeout(refreshTimer);
     refreshTimer = setTimeout(refresh, 150);
   }
+
+  // Observation package was applied (possibly creating a new batch).
+  async function onImportApplied(e) {
+    await loadBatches();
+    if (e.detail?.batchId) {
+      selA = e.detail.batchId;
+      await refresh();
+    }
+  }
+
+  async function onImportChanged() {
+    await refresh();
+  }
 </script>
 
 <header style="padding:14px 20px;border-bottom:1px solid var(--line)">
@@ -417,6 +431,11 @@
               <td>
                 <span class="tag {e.source}">{e.source === 'manual' ? '人工' : '自动建议'}</span>
                 {e.created_by}
+                {#if e.source_package_id}
+                  <div class="tag imported" style="margin-top:2px;font-size:10px" title="来源观察包">
+                    📦 {e.source_package_id}
+                  </div>
+                {/if}
               </td>
               <td class="muted" style="font-size:11px;max-width:180px;overflow:hidden;text-overflow:ellipsis">
                 {e.label}
@@ -457,6 +476,19 @@
             总点 {dataA.series.raw_points.length}；
             插值点 {dataA.series.interpolated_t_s.length} 个，仅用于引导线，不写回原始采样表。
           </div>
+          {#if dataA.provenance}
+            <div style="margin-top:8px">
+              <div class="muted" style="font-size:12px">样本来源（保留原始来源与包标识）</div>
+              <div class="row" style="gap:6px;margin-top:4px;flex-wrap:wrap">
+                {#each dataA.provenance.samples_by_source as s}
+                  <span class="tag {s.source_package_id ? 'imported' : 'synthetic'}"
+                    title={s.source_package_id || '合成生成器'}>
+                    {s.source_package_id ? `包 ${s.source_package_id}` : '合成生成器'} · {s.count} 点
+                  </span>
+                {/each}
+              </div>
+            </div>
+          {/if}
         </div>
         <div style="flex:1;min-width:280px">
           <button on:click={verifyExport}>
@@ -488,4 +520,13 @@
       </div>
     </section>
   {/if}
+
+  <ImportPanel
+    {batches}
+    {windowS}
+    {smoothS}
+    {maxGapFillS}
+    on:applied={onImportApplied}
+    on:changed={onImportChanged}
+  />
 </main>

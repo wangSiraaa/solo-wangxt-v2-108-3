@@ -19,11 +19,22 @@ os.environ.setdefault("DATABASE_URL", "sqlite:///./test.db")
 from app import models  # noqa: E402
 from app.main import app  # noqa: E402
 
+# Schema is created (and migrated) once at import time, before any test or
+# fixture runs; per-test cleanup only deletes data rows.
+models.Base.metadata.drop_all(models.engine)
+models.init_db()
+
 
 @pytest.fixture(scope="session")
 def client():
-    # deterministic start: recreate every table
-    models.Base.metadata.drop_all(models.engine)
-    models.Base.metadata.create_all(models.engine)
     with TestClient(app) as c:
         yield c
+
+
+@pytest.fixture(autouse=True)
+def _clean_tables():
+    """Each test starts from empty data tables (schema stays in place)."""
+    with models.engine.begin() as conn:
+        for table in reversed(models.Base.metadata.sorted_tables):
+            conn.execute(table.delete())
+    yield

@@ -53,6 +53,16 @@ select, input {
   color: var(--muted);
 }
 .tag.manual { color: #f3c98b; border-color: #6b5326; }
+.tag.auto { color: #7fb6e6; border-color: #2c4a66; }
+.tag.imported { color: #7ee0c2; border-color: #2c6b56; }
+.tag.synthetic { color: #a89b8c; }
+/* import ledger statuses */
+.tag.pending_review { color: #f3c98b; border-color: #6b5326; }
+.tag.applied { color: #7ee0c2; border-color: #2c6b56; }
+.tag.failed { color: #e35d5d; border-color: #6b2c2c; }
+.tag.aborted { color: #8a8077; }
+button:disabled { opacity: 0.5; cursor: not-allowed; }
+table tr[role='button']:hover td { background: #2c2621; }
 table { border-collapse: collapse; width: 100%; font-size: 13px; }
 td, th { text-align: left; padding: 4px 8px; border-bottom: 1px solid var(--line); }
 .row { display: flex; gap: 14px; flex-wrap: wrap; }

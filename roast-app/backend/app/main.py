@@ -1,4 +1,5 @@
-"""FastAPI application: batch curves, sourced events, comparison, export."""
+"""FastAPI application: batch curves, sourced events, comparison, export,
+and offline observation-package import."""
 from __future__ import annotations
 
 import json
@@ -12,8 +13,10 @@ from sqlalchemy.orm import Session
 from . import synth
 from .analysis import RoRConfig, build_series, current_events, phase_metrics
 from .config import CORS_ORIGINS, MAX_GAP_FILL_S
-from .models import Batch, Event, Sample, engine, init_db
-from .schemas import BatchMeta, EventIn, EventOut
+from .importer import package as pkgmod
+from .importer import service as import_service
+from .models import Batch, Event, ImportBatch, Sample, engine, init_db
+from .schemas import BatchMeta, ConflictResolutionIn, EventIn, EventOut, ImportRequest
 
 app = FastAPI(title="Coffee Roast Batch Explorer", version="1.0.0")
 app.add_middleware(
@@ -46,6 +49,8 @@ def _samples_as_dicts(batch: Batch) -> list[dict]:
             "t_s": s.t_s,
             "bean_temp_c": s.bean_temp_c,
             "env_temp_c": s.env_temp_c,
+            "source": s.source,
+            "source_package_id": s.source_package_id,
         }
         for s in batch.samples
     ]
@@ -70,9 +75,36 @@ def _events_as_dicts(batch: Batch, *, include_history: bool) -> list[dict]:
                 "superseded": e.superseded,
                 "superseded_by_id": e.superseded_by_id,
                 "created_at": e.created_at.isoformat(),
+                "event_uid": e.event_uid,
+                "source_package_id": e.source_package_id,
             }
         )
     return rows
+
+
+def _provenance(batch: Batch) -> dict[str, Any]:
+    """Where every measured point/event on this batch came from."""
+    by_pkg_samples: dict[str | None, int] = {}
+    for s in batch.samples:
+        key = s.source_package_id
+        by_pkg_samples[key] = by_pkg_samples.get(key, 0) + 1
+    by_pkg_events: dict[str | None, int] = {}
+    for e in batch.events:
+        key = e.source_package_id
+        by_pkg_events[key] = by_pkg_events.get(key, 0) + 1
+    return {
+        "samples_by_source": [
+            {"source_package_id": pid, "count": n}
+            for pid, n in sorted(by_pkg_samples.items(), key=lambda kv: (kv[0] is None, str(kv[0])))
+        ],
+        "events_by_source_package": [
+            {"source_package_id": pid, "count": n}
+            for pid, n in sorted(by_pkg_events.items(), key=lambda kv: (kv[0] is None, str(kv[0])))
+        ],
+        "imported_sample_count": sum(
+            n for pid, n in by_pkg_samples.items() if pid is not None
+        ),
+    }
 
 
 def _series_payload(
@@ -94,6 +126,7 @@ def _series_payload(
         "series": series,
         "events": events,
         "metrics": phase_metrics(events),
+        "provenance": _provenance(batch),
         "params": {
             "ror_window_s": window_s,
             "ror_display_smooth_s": display_smooth_s,
@@ -270,7 +303,22 @@ def export_batch(batch_id: int, window_s: float = 30.0, display_smooth_s: float 
             "metrics_depend_on": ["raw_samples", "current(non-superseded) events", "ror_window_s"],
             "pipeline": "numpy centred least-squares RoR; linear gap fill flagged",
         }
+        payload["provenance"]["event_history_by_source_package"] = _event_provenance(b)
         return payload
+
+
+def _event_provenance(batch: Batch) -> list[dict[str, Any]]:
+    """Full append-only event history grouped by originating package."""
+    counts: dict[str | None, dict[str, int]] = {}
+    for e in batch.events:
+        d = counts.setdefault(e.source_package_id, {"total": 0, "superseded": 0})
+        d["total"] += 1
+        if e.superseded:
+            d["superseded"] += 1
+    return [
+        {"source_package_id": pid, "total": d["total"], "superseded": d["superseded"]}
+        for pid, d in sorted(counts.items(), key=lambda kv: (kv[0] is not None, str(kv[0])))
+    ]
 
 
 @app.post("/api/recompute")
@@ -286,6 +334,18 @@ def recompute(payload: dict[str, Any]) -> dict[str, Any]:
         params = payload.get("params", {})
     except KeyError as exc:
         raise HTTPException(422, f"missing field: {exc}")
+    # Preserve per-sample provenance if the export carried it; recompute must
+    # be able to reproduce *which package* every reading came from.
+    samples = [
+        {
+            "t_s": s["t_s"],
+            "bean_temp_c": s.get("bean_temp_c"),
+            "env_temp_c": s.get("env_temp_c"),
+            "source": s.get("source"),
+            "source_package_id": s.get("source_package_id"),
+        }
+        for s in samples
+    ]
     cfg = RoRConfig(
         window_s=float(params.get("ror_window_s", 30.0)),
         display_smooth_s=float(params.get("ror_display_smooth_s", 12.0)),
@@ -305,3 +365,160 @@ def recompute(payload: dict[str, Any]) -> dict[str, Any]:
 @app.get("/api/health")
 def health() -> dict[str, str]:
     return {"status": "ok", "machine_connection": "none (synthetic/offline only)"}
+
+
+# ---------------------------------------------------------------------------
+# offline observation-package import (local files only; never uploaded)
+# ---------------------------------------------------------------------------
+#
+# Lifecycle:
+#   POST /api/imports                 receive  -> pending_review (or failed)
+#   GET  /api/imports                 ledger
+#   GET  /api/imports/{id}/preview    projection + conflicts (writes nothing)
+#   POST /api/imports/{id}/resolve    adjudicate conflicts
+#   POST /api/imports/{id}/apply      atomic apply (one transaction)
+#   POST /api/imports/{id}/abort      discard a pending delivery
+#
+# The browser reads a locally chosen file and POSTs the parsed JSON to this
+# same-origin API.  Nothing is sent to any machine or external service.
+
+
+@app.post("/api/imports")
+def import_receive(req: ImportRequest) -> dict[str, Any]:
+    """Accept one observation package into the ledger (pending review).
+
+    Invalid packages fail *as a whole*: the only write is a ``failed`` ledger
+    row carrying every validation finding — no batch/sample/event changes.
+    Re-posting the identical package returns the original ledger row; the
+    same ``package_id`` with different content is rejected with 409.
+    """
+    raw = req.package
+    raw_text = json.dumps(raw, ensure_ascii=False, sort_keys=True)
+    with Session(engine) as s:
+        actual_digest: str | None = None
+        if isinstance(raw, dict):
+            try:
+                actual_digest = pkgmod.canonical_digest(raw)
+            except (TypeError, ValueError):
+                actual_digest = None
+        try:
+            pkg = pkgmod.validate_package(raw)
+        except pkgmod.PackageError as exc:
+            imp = import_service.record_failure(
+                s,
+                raw_text=raw_text,
+                raw=raw,
+                error_code=exc.code,
+                findings=exc.findings,
+                actual_digest=actual_digest,
+            )
+            # The failed ledger row is already committed (audit trail); the
+            # 422 only signals that nothing was applied.
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "ok": False,
+                    "import": import_service.ledger_summary(imp),
+                    "error_code": exc.code,
+                    "findings": exc.findings,
+                },
+            )
+        imp = import_service.receive_package(
+            s,
+            raw=raw,
+            raw_text=raw_text,
+            pkg=pkg,
+            target_batch_id=req.target_batch_id,
+            created_by=req.created_by,
+            actual_digest=actual_digest,
+        )
+        n_conflicts = len(imp.conflicts)
+        return {
+            **import_service.ledger_summary(imp),
+            "ok": True,
+            "conflict_count": n_conflicts,
+            "next_step": (
+                "apply"
+                if n_conflicts == 0 and imp.status == "pending_review"
+                else "review_conflicts"
+            ),
+        }
+
+
+@app.get("/api/imports")
+def import_list(status: str | None = Query(None)) -> list[dict[str, Any]]:
+    with Session(engine) as s:
+        q = select(ImportBatch).order_by(ImportBatch.received_at.desc(), ImportBatch.id.desc())
+        rows = list(s.scalars(q))
+        if status:
+            rows = [r for r in rows if r.status == status]
+        out = []
+        for r in rows:
+            d = import_service.ledger_summary(r)
+            d["conflict_count"] = len(r.conflicts)
+            d["unresolved_count"] = sum(
+                1 for c in r.conflicts if c.resolution is None
+            )
+            out.append(d)
+        return out
+
+
+def _get_import(session: Session, import_id: int) -> ImportBatch:
+    imp = session.get(ImportBatch, import_id)
+    if imp is None:
+        raise HTTPException(404, f"import {import_id} not found")
+    return imp
+
+
+@app.get("/api/imports/{import_id}/preview")
+def import_preview(
+    import_id: int,
+    window_s: float = Query(30.0, gt=0, le=300),
+    display_smooth_s: float = Query(12.0, ge=0, le=180),
+    max_gap_fill_s: float = Query(MAX_GAP_FILL_S, gt=0, le=600),
+) -> dict[str, Any]:
+    with Session(engine) as s:
+        imp = _get_import(s, import_id)
+        return import_service.preview_import(
+            s,
+            imp,
+            ror_cfg=RoRConfig(window_s=window_s, display_smooth_s=display_smooth_s),
+            max_gap_fill_s=max_gap_fill_s,
+        )
+
+
+@app.post("/api/imports/{import_id}/resolve")
+def import_resolve(import_id: int, req: ConflictResolutionIn) -> dict[str, Any]:
+    with Session(engine) as s:
+        imp = _get_import(s, import_id)
+        imp = import_service.resolve_conflicts(
+            s,
+            imp,
+            resolutions=req.resolutions,
+            resolved_by=req.resolved_by,
+        )
+        d = import_service.ledger_summary(imp)
+        d["conflicts"] = [import_service._conflict_out(c) for c in imp.conflicts]
+        d["unresolved_count"] = sum(
+            1 for c in imp.conflicts if c.resolution is None
+        )
+        return d
+
+
+@app.post("/api/imports/{import_id}/apply")
+def import_apply(import_id: int) -> dict[str, Any]:
+    """Apply one reviewed package atomically.
+
+    Requires zero unresolved conflicts.  Samples/events are written in a
+    single transaction; any failure rolls back completely.  Re-applying an
+    already-applied package returns the original result (idempotency)."""
+    with Session(engine) as s:
+        imp = _get_import(s, import_id)
+        return import_service.apply_import(s, imp, applied_by=imp.created_by or "operator")
+
+
+@app.post("/api/imports/{import_id}/abort")
+def import_abort(import_id: int) -> dict[str, Any]:
+    with Session(engine) as s:
+        imp = _get_import(s, import_id)
+        return import_service.abort_import(s, imp)

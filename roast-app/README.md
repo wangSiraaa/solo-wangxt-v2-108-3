@@ -1,7 +1,8 @@
 # 烘焙批次曲线对比系统
 
 面向烘焙负责人的**过程记录**工具：并排查看豆温、环境温度与操作事件（回温点、一爆、风门变化、出锅），
-而不是用成品评分替代过程。系统**不连接真实烘焙机**，数据来自带噪声、不均采样与探针失联的合成生成器。
+而不是用成品评分替代过程。系统**不连接真实烘焙机**，数据来自带噪声、不均采样与探针失联的合成生成器，
+或操作员在现场离线记录、带回工作台的**本地观察包**（文件只在浏览器本地读取，绝不上传）。
 
 ## 技术栈
 
@@ -33,6 +34,50 @@
 - 事件为只追加（append-only）。人工提交同类型事件时，旧行置 `superseded=true` 并记录
   `superseded_by_id`，不删除；自动建议记 `source=auto`，人工记 `source=manual`+`created_by`；
 - 风门变化允许多条并存（离散操作点），金色虚线标出。
+
+### 离线观察包 —— 本地文件、待核验、一次性应用（不上传）
+现场记录可打包成 JSON **观察包**，带回工作台后从界面选择**本地文件**导入；浏览器仅本地读取并提交给
+同源的本机 API，**不连接真实烘焙机、不发往任何外部服务**。
+
+包格式 v1（自描述、可验真）：
+
+| 字段 | 说明 |
+|---|---|
+| `format_version` | 格式版本，当前 `1`；其他版本整包拒绝 |
+| `package_id` | 稳定包标识（同一标识即同一次投递，用于幂等与去重） |
+| `generated_at` | 现场生成时间（ISO 8601） |
+| `batch` | 批次信息：name/roaster/bean/charge_at/charge_temp_c/ambient_temp_c… |
+| `samples[]` | 原始实测点：`t_s`（自下豆秒，可不均）、`bean_temp_c`/`env_temp_c`（缺测为 `null`） |
+| `events[]` | 现场事件：稳定 `event_uid`、可选 `supersedes_uid`（包内修正链）、类型、`t_s`、来源 |
+| `digest` | `{"algorithm":"sha256","sha256":…}`，对前述字段规范化 JSON 的摘要 |
+
+摘要口径：对 `{format_version, package_id, generated_at, batch, samples, events}` 做
+`json.dumps(sort_keys=True, separators=(",",":"), ensure_ascii=False)` 后取 `sha256`；
+`digest` 块本身不参与签名。**摘要不一致即整包失败**。
+
+导入生命周期（全部可审计）：
+
+1. **接收 → `pending_review`**：只在 `import_batches` 账本落一份原文与摘要，**不写任何样本/事件**；
+   同时对目标批次做冲突检测（结果存 `import_conflicts`）。
+2. **预览**：用与应用完全相同的纯函数合并逻辑生成“目标曲线 + 指标 + 事件历史”投影，**不写库**。
+3. **冲突裁决**：同一时刻已有不同实测值（`value_mismatch`）、或已存为空而包内补来读数
+   （`missing_fill`）都必须逐条选择“保留已有 / 采用包内”。**未裁决前当前分析一点不变**。
+4. **一次性应用**：单事务写入；任何错误整体回滚，**不存在半套曲线**。应用结果（计数、批次、裁决）
+   存回账本作为幂等结果。
+
+去重与顺序规则：
+- **重复投递**：同 `package_id` 且摘要相同，返回原账本行/原应用结果，不新增样本或事件；同标识但内容
+  不同返回 409。
+- **同值重复**：同一时刻读数一致（含 1e-3 容差）直接跳过；缺测（null）绝不覆盖已有实测。
+- **乱序到达**：后到的“更早片段”按 `t_s` 并入，来源仍记对应包。
+- **事件**：继续遵守只追加 + supersede 历史；`(batch_id, event_uid)` 去重，包内 `supersedes_uid`
+  必须指向同类型、不晚于自身的已存在事件。
+- **整包失败**（`failed` 账本行，附全部发现项）：不支持的版本、摘要不符、非法/非有限时间、
+  包内重复 `t_s`、重复 `event_uid`（重复事件链）、supersede 悬空或类型不符、supersede 指向更晚
+  事件、阶段锚点逆序（如 charge 晚于 turning point）、风门缺开度/越界、解析失败等。数据库的
+  批次/样本/事件表**没有任何残留变更**。
+- 每个导入样本/事件都保留 `source`（`imported`/录制来源）与 `source_package_id`；曲线、事件表、
+  导出 JSON、`/api/recompute` 独立重算均可逐点/逐条看到来源包。
 
 ### 发展时间比 —— 明确区间
 | 指标 | 区间 |
@@ -94,11 +139,19 @@
 | GET | `/api/batches/{id}/series?window_s&display_smooth_s&max_gap_fill_s` | 曲线+RoR+指标 |
 | GET/POST | `/api/batches/{id}/events[?include_history=true]` | 事件列表/人工修正（只追加） |
 | GET | `/api/compare?a=&b=` | 双批次叠加（含非因果声明） |
-| GET | `/api/batches/{id}/export` | 自包含导出 |
-| POST | `/api/recompute` | 从导出载荷独立重算全部派生指标 |
+| GET | `/api/batches/{id}/export` | 自包含导出（含逐点来源包、事件历史来源分组） |
+| POST | `/api/recompute` | 从导出载荷独立重算全部派生指标（保留来源） |
+| POST | `/api/imports` | 接收观察包入账本（待核验；非法包整包失败 422，幂等） |
+| GET | `/api/imports[?status=]` | 导入账本（含失败/已应用记录与冲突计数） |
+| GET | `/api/imports/{id}/preview` | 预览投影 + 冲突清单（不写库） |
+| POST | `/api/imports/{id}/resolve` | 提交冲突裁决（保留已有/采用包内） |
+| POST | `/api/imports/{id}/apply` | 一次性应用（单事务；重复调用返回原结果） |
+| POST | `/api/imports/{id}/abort` | 放弃待核验包（账本留痕，曲线不变） |
 
 ## 目录
 
     backend/app/  config.py models.py analysis.py synth.py schemas.py main.py
-    frontend/src/ App.svelte lib/RoastChart.svelte lib/api.js
-    tests/        test_analysis.py test_api.py（双后端同一套用例）
+                  importer/  package.py(解析/摘要/整包校验) planner.py(预览=应用同一合并逻辑)
+                             service.py(账本/冲突/事务应用)
+    frontend/src/ App.svelte lib/RoastChart.svelte lib/ImportPanel.svelte lib/api.js
+    tests/        test_analysis.py test_api.py test_imports.py（双后端同一套用例）

@@ -239,6 +239,10 @@ def build_series(
             "ror_n_points": int(ror["n_points_used"][i]),
             "ror_edge": bool(ror["edge"][i]),
             "is_interpolated": bool(bean_interp[i]),
+            # Provenance of the measured reading (None for callers that only
+            # supply values, e.g. /api/recompute from a minimal payload).
+            "source": samples[i].get("source"),
+            "source_package_id": samples[i].get("source_package_id"),
         }
         for i in range(len(t))
     ]
